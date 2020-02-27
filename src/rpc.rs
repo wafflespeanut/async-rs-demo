@@ -7,7 +7,7 @@ use tonic::{transport::Server, Request, Response, Status};
 use std::net::SocketAddr;
 
 #[derive(Debug)]
-pub struct Service;
+struct Service;
 
 #[tonic::async_trait]
 impl Aggregator for Service {
@@ -15,7 +15,7 @@ impl Aggregator for Service {
 
     async fn book_summary(
         &self,
-        req: Request<Empty>,
+        _req: Request<Empty>,
     ) -> Result<Response<Self::BookSummaryStream>, Status> {
         unimplemented!();
     }
@@ -27,7 +27,6 @@ pub async fn serve(addr: SocketAddr) -> Result<(), AggregatorError> {
     Server::builder()
         .add_service(AggregatorServer::new(Service))
         .serve(addr)
-        .await
-        .map_err(AggregatorError::Rpc)?;
+        .await?;
     Ok(())
 }
