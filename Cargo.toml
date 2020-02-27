@@ -14,9 +14,10 @@ name = "aggregator-client"
 path = "src/client.rs"
 
 [dependencies]
+failure = "0.1"
 futures = "0.3"
 prost = "0.6"
-tokio = { version = "0.2", features = ["sync", "stream"] }
+tokio = { version = "0.2", features = ["macros", "sync", "stream"] }
 tonic = "0.1"
 
 [build-dependencies]
