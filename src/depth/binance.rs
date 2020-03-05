@@ -1,7 +1,5 @@
 use super::{DepthProvider, OrderBook, SocketState};
 use crate::error::AggregatorError;
-use futures::sink::SinkExt;
-use futures::stream::StreamExt;
 use tungstenite::Message;
 
 use std::ops::{Deref, DerefMut};
@@ -17,9 +15,13 @@ pub struct BinanceSocket {
 
 #[async_trait::async_trait]
 impl DepthProvider for BinanceSocket {
-    /// URL for combined streams in Binance.
 
-    fn base_url(&self) -> &str {
+    fn identifier(&self) -> &'static str {
+        "binance"
+    }
+
+    /// URL for combined streams in Binance.
+    fn base_url(&self) -> &'static str {
         "wss://stream.binance.com:9443/stream"
     }
 
@@ -35,7 +37,7 @@ impl DepthProvider for BinanceSocket {
             params: self
                 .state
                 .subscriptions
-                .keys()
+                .iter()
                 .map(String::as_str)
                 .map(|s| format!("{}{}", s, DEPTH_SUFFIX))
                 .collect(),
@@ -51,6 +53,7 @@ impl DepthProvider for BinanceSocket {
                 let symbol = &resp.stream[..DEPTH_SUFFIX.len()];
 
                 return Some(OrderBook {
+                    exchange: self.identifier(),
                     symbol: symbol.into(),
                     bids: resp
                         .data

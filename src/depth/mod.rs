@@ -1,16 +1,18 @@
 mod binance;
+mod merger;
 
 pub use self::binance::BinanceSocket;
+pub use self::merger::Merger;
 
 use crate::error::AggregatorError;
-use futures::channel::mpsc::{self, Receiver, Sender, UnboundedReceiver, UnboundedSender};
+use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender};
 use futures::sink::SinkExt;
-use futures::stream::{self, SplitSink, SplitStream, StreamExt};
+use futures::stream::{self, StreamExt};
 use tokio::net::TcpStream;
 use tokio_tungstenite::WebSocketStream;
 use tungstenite::Message;
 
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::iter;
 use std::ops::DerefMut;
 use std::time::Duration;
@@ -23,8 +25,11 @@ type WsStream = WebSocketStream<TcpStream>;
 #[async_trait::async_trait]
 pub trait DepthProvider: DerefMut<Target = SocketState> + Send + Sync + 'static {
 
+    /// Identifier for this provider.
+    fn identifier(&self) -> &'static str;
+
     /// Base URL for the websocket.
-    fn base_url(&self) -> &str;
+    fn base_url(&self) -> &'static str;
 
     /// Reset the internal state of this provider. This is called when we
     /// recreate a connection.
@@ -41,9 +46,9 @@ pub trait DepthProvider: DerefMut<Target = SocketState> + Send + Sync + 'static 
 
     async fn start_processing(
         &mut self,
-        mut action_sender: UnboundedSender<ProviderAction>,
+        action_sender: UnboundedSender<ProviderAction>,
         action_receiver: UnboundedReceiver<ProviderAction>,
-        mut book_stream_sender: UnboundedSender<BookStream>,
+        book_sender: UnboundedSender<OrderBook>,
     ) {
         let stream = self.attempt_connection().await;
         let (mut writer, reader) = stream.split();
@@ -66,9 +71,8 @@ pub trait DepthProvider: DerefMut<Target = SocketState> + Send + Sync + 'static 
                 // from it and log it otherwise.
                 Some(ProcessOutput::Socket(Ok(Message::Binary(bytes)))) => {
                     if let Some(book) = self.process_message(&bytes) {
-                        if let Some(sender) = self.subscriptions.get_mut(&book.symbol) {
-                            // We're sure that we'll consume the books properly.
-                            let _ = sender.send(book).await;
+                        if self.subscriptions.contains(&book.symbol) {
+                            let _ = book_sender.unbounded_send(book);
                         } else if log::log_enabled!(log::Level::Debug) {
                             warn!("Received order book for unknown symbol: {}", &book.symbol);
                         }
@@ -87,24 +91,17 @@ pub trait DepthProvider: DerefMut<Target = SocketState> + Send + Sync + 'static 
                 // issue a new subscription if needed.
                 Some(ProcessOutput::Action(ProviderAction::Subscribe { symbol, replace })) => {
                     let symbol = symbol.to_lowercase();
-                    if self.subscriptions.get(&symbol).is_some() && !replace {
+                    if self.subscriptions.contains(&symbol) && !replace {
                         continue;
                     }
 
-                    // We're using a bounded channel because we know we know that the service
-                    // can consume almost immediately. But still, let's have some buffer.
-                    let (sender, receiver) = mpsc::channel(10);
-                    self.subscriptions.insert(symbol.clone(), sender);
+                    self.subscriptions.insert(symbol.clone());
                     let msg = self.create_subscription_message(&symbol);
 
                     if let Err(e) = writer.send(msg).await {
                         error!("Error subscribing to symbol {}: {:?}", symbol, e);
                         self.subscriptions.remove(&symbol);
                     }
-
-                    let _ = book_stream_sender
-                        .send(BookStream { symbol, receiver })
-                        .await;
                 }
                 // If we get disconnected accidentally or intentionally, reconnect again.
                 Some(ProcessOutput::Reconnect)
@@ -123,7 +120,7 @@ pub trait DepthProvider: DerefMut<Target = SocketState> + Send + Sync + 'static 
 
                     self.reset();
                     // Notify self to resubscribe existing subscriptions.
-                    for (symbol, _) in self.subscriptions.drain() {
+                    for symbol in self.subscriptions.drain() {
                         let _ = action_sender
                             .unbounded_send(ProviderAction::Subscribe {
                                 symbol,
@@ -165,7 +162,7 @@ pub enum ProviderAction {
 /// streams the order book.
 #[derive(Default)]
 pub struct SocketState {
-    subscriptions: HashMap<String, Sender<OrderBook>>,
+    subscriptions: HashSet<String>,
 }
 
 /// An order book containing the asks and bids returned by the stream. The exact number
@@ -173,15 +170,10 @@ pub struct SocketState {
 // NOTE: As soon as we parse the string as floats, we'll encounter floating point errors.
 // Maybe we should use them only for comparison and maintain them as strings? Does it matter?
 pub struct OrderBook {
+    exchange: &'static str,
     symbol: String,
     bids: Vec<(f64, f64)>,
     asks: Vec<(f64, f64)>,
-}
-
-/// Represents a stream of order books for a symbol.
-pub struct BookStream {
-    symbol: String,
-    receiver: Receiver<OrderBook>,
 }
 
 /// Internal enum for selecting over streams.
