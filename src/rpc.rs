@@ -23,7 +23,7 @@ impl Aggregator for Service {
 
 /// Initializes the gRPC service for orderbook aggregation.
 pub async fn serve(addr: SocketAddr) -> Result<(), AggregatorError> {
-    println!("Listening for requests in {}", addr);
+    info!("Listening for requests in {}", addr);
     Server::builder()
         .add_service(AggregatorServer::new(Service))
         .serve(addr)
