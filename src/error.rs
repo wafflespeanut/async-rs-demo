@@ -27,6 +27,8 @@ pub enum AggregatorError {
     Websocket(tungstenite::Error),
     #[fail(display = "JSON coding error: {}", _0)]
     Json(serde_json::Error),
+    #[fail(display = "Subscription already exists for exchange: {}", _0)]
+    SubscriptionExists(String),
 }
 
 // impl_err_from! {AggregatorError::reqwest::Error > Reqwest}

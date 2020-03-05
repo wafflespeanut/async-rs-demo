@@ -1,5 +1,4 @@
-use crate::codegen::aggregator_server::{Aggregator, AggregatorServer};
-use crate::codegen::{Empty, Summary};
+use crate::codegen::{self, aggregator_server::{Aggregator, AggregatorServer}};
 use crate::error::AggregatorError;
 use tokio::sync::mpsc;
 use tonic::{transport::Server, Request, Response, Status};
@@ -11,11 +10,11 @@ struct Service;
 
 #[tonic::async_trait]
 impl Aggregator for Service {
-    type BookSummaryStream = mpsc::Receiver<Result<Summary, Status>>;
+    type BookSummaryStream = mpsc::Receiver<Result<codegen::Summary, Status>>;
 
     async fn book_summary(
         &self,
-        _req: Request<Empty>,
+        _req: Request<codegen::Request>,
     ) -> Result<Response<Self::BookSummaryStream>, Status> {
         unimplemented!();
     }
