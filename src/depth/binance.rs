@@ -1,73 +1,74 @@
-use super::{DepthProvider, DepthProviderInit, OrderBook, Socket};
+use super::{DepthProvider, OrderBook, SocketState};
 use crate::error::AggregatorError;
-use futures::stream::StreamExt;
 use futures::sink::SinkExt;
+use futures::stream::StreamExt;
 use tungstenite::Message;
 
-use std::iter;
 use std::ops::{Deref, DerefMut};
 
+const DEPTH_SUFFIX: &str = "@depth20";
+
+#[derive(Default)]
 pub struct BinanceSocket {
-    socket: Socket,
+    state: SocketState,
     /// Incrementing index to track messages sent back and forth.
     idx: usize,
 }
 
 #[async_trait::async_trait]
-impl DepthProviderInit for BinanceSocket {
-
-    /// URL for combined stream.
-    const BASE_URL: &'static str = "wss://stream.binance.com:9443/stream";
-}
-
-#[async_trait::async_trait]
 impl DepthProvider for BinanceSocket {
+    /// URL for combined streams in Binance.
 
-    async fn create_subscription_message(&mut self, symbol: &str) -> Result<Message, AggregatorError> {
+    fn base_url(&self) -> &str {
+        "wss://stream.binance.com:9443/stream"
+    }
+
+    fn reset(&mut self) {
+        self.idx = 0;
+    }
+
+    fn create_subscription_message(&mut self, _symbol: &str) -> Message {
         let bytes = serde_json::to_vec(&Request {
             id: self.idx,
             method: Method::Subscribe,
-            // Subscriptions are replaced, so we need all the existing subscriptions.
-            params: self.socket.subscriptions.keys().map(String::as_str).chain(iter::once(symbol))
-                .map(|s| format!("{}@depth20", s))
+            // Subscriptions are "PUT" in binance, so we need all the existing subscriptions.
+            params: self
+                .state
+                .subscriptions
+                .keys()
+                .map(String::as_str)
+                .map(|s| format!("{}{}", s, DEPTH_SUFFIX))
                 .collect(),
-        })?;
+        })
+        .expect("serializing subscription request");
         self.idx += 1;
-        Ok(Message::Binary(bytes))
+        Message::Binary(bytes)
     }
 
-    async fn get_message(&mut self) -> Result<OrderBook, AggregatorError> {
-        trace!("Waiting for message.");
-        loop {
-            // Binance socket information - https://github.com/binance-exchange/binance-official-api-docs/blob/master/web-socket-streams.md#general-wss-information
-            match self.socket.reader.next().await {
-                // Server sends a "ping" frame every 3 minutes and expects a "pong" frame back.
-                Some(Ok(Message::Ping(bytes))) => {
-                    debug!("Received ping. Responding with pong.");
-                    if let Err(e) = self.socket.writer.send(Message::Pong(bytes)).await {
-                        error!("Error responding with pong: {:?}", e);
-                    }
-                }
-                Some(Ok(Message::Binary(bytes))) => {
-                    if let Ok(resp) = serde_json::from_slice::<Response>(&bytes) {
-                        return Ok(OrderBook {
-                            bids: resp.data.bids,
-                            asks: resp.data.asks,
-                        });
-                    }
+    fn process_message(&mut self, bytes: &[u8]) -> Option<OrderBook> {
+        if let Ok(resp) = serde_json::from_slice::<Response>(&bytes) {
+            if resp.stream.ends_with(DEPTH_SUFFIX) {
+                let symbol = &resp.stream[..DEPTH_SUFFIX.len()];
 
-                    if log::log_enabled!(log::Level::Debug) {
-                        warn!("Error decoding message: {}", String::from_utf8_lossy(&bytes));
-                    }
-                }
-                // Server disconnects every 24 hours. If we receive a close frame, then
-                // reconnect again.
-                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => {
-                    *self = Self::connect_socket().await?;
-                }
-                _ => (),
+                return Some(OrderBook {
+                    symbol: symbol.into(),
+                    bids: resp
+                        .data
+                        .bids
+                        .into_iter()
+                        .filter_map(|(p, q)| p.parse().and_then(|p| q.parse().map(|q| (p, q))).ok())
+                        .collect(),
+                    asks: resp
+                        .data
+                        .asks
+                        .into_iter()
+                        .filter_map(|(p, q)| p.parse().and_then(|p| q.parse().map(|q| (p, q))).ok())
+                        .collect(),
+                });
             }
         }
+
+        None
     }
 }
 
@@ -94,31 +95,22 @@ struct Response {
 
 #[derive(Deserialize)]
 struct ResponseOrderBook {
-    bids: Vec<[String; 2]>,
-    asks: Vec<[String; 2]>,
+    bids: Vec<(String, String)>,
+    asks: Vec<(String, String)>,
 }
 
 /* Other impls */
 
-impl From<Socket> for BinanceSocket {
-    fn from(s: Socket) -> Self {
-        BinanceSocket {
-            socket: s,
-            idx: 0,
-        }
-    }
-}
-
 impl Deref for BinanceSocket {
-    type Target = Socket;
+    type Target = SocketState;
 
     fn deref(&self) -> &Self::Target {
-        &self.socket
+        &self.state
     }
 }
 
 impl DerefMut for BinanceSocket {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.socket
+        &mut self.state
     }
 }
