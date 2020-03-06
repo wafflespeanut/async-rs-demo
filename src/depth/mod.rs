@@ -4,7 +4,6 @@ mod merger;
 pub use self::binance::BinanceSocket;
 pub use self::merger::Merger;
 
-use crate::error::AggregatorError;
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender};
 use futures::sink::SinkExt;
 use futures::stream::{self, StreamExt};
@@ -12,6 +11,7 @@ use tokio::net::TcpStream;
 use tokio_tungstenite::WebSocketStream;
 use tungstenite::Message;
 
+use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::iter;
 use std::ops::DerefMut;
@@ -21,17 +21,16 @@ const CONN_FAIL_DELAY_SECS: u64 = 5;
 
 type WsStream = WebSocketStream<TcpStream>;
 
-/// Represents an order book depth provider.
+/// Represents an order book depth processor for a provider.
 #[async_trait::async_trait]
-pub trait DepthProvider: DerefMut<Target = SocketState> + Send + Sync + 'static {
-
+pub trait DepthProcessor: DerefMut<Target = SocketState> + Send + Sync + 'static {
     /// Identifier for this provider.
     fn identifier(&self) -> &'static str;
 
     /// Base URL for the websocket.
     fn base_url(&self) -> &'static str;
 
-    /// Reset the internal state of this provider. This is called when we
+    /// Reset the internal state of this processor. This is called when we
     /// recreate a connection.
     fn reset(&mut self);
 
@@ -46,8 +45,8 @@ pub trait DepthProvider: DerefMut<Target = SocketState> + Send + Sync + 'static 
 
     async fn start_processing(
         &mut self,
-        action_sender: UnboundedSender<ProviderAction>,
-        action_receiver: UnboundedReceiver<ProviderAction>,
+        action_sender: UnboundedSender<ProcessorAction>,
+        action_receiver: UnboundedReceiver<ProcessorAction>,
         book_sender: UnboundedSender<OrderBook>,
     ) {
         let stream = self.attempt_connection().await;
@@ -63,8 +62,12 @@ pub trait DepthProvider: DerefMut<Target = SocketState> + Send + Sync + 'static 
             match combined.next().await {
                 // If we receive a ping from server, then send a pong.
                 Some(ProcessOutput::Socket(Ok(Message::Ping(bytes)))) => {
-                    if let Err(e) = writer.send(Message::Pong(bytes)).await {
-                        error!("Error responding with pong: {:?}", e);
+                    if let Err(err) = writer.send(Message::Pong(bytes)).await {
+                        error!(
+                            "Error responding with pong to {:?}: {:?}",
+                            self.identifier(),
+                            err
+                        );
                     }
                 }
                 // If we receive a binary message from server, then try to get the orderbook
@@ -72,9 +75,13 @@ pub trait DepthProvider: DerefMut<Target = SocketState> + Send + Sync + 'static 
                 Some(ProcessOutput::Socket(Ok(Message::Binary(bytes)))) => {
                     if let Some(book) = self.process_message(&bytes) {
                         if self.subscriptions.contains(&book.symbol) {
-                            let _ = book_sender.unbounded_send(book);
+                            let _ = book_sender.unbounded_send(book.sorted());
                         } else if log::log_enabled!(log::Level::Debug) {
-                            warn!("Received order book for unknown symbol: {}", &book.symbol);
+                            warn!(
+                                "Received order book for unknown symbol from {:?}: {}",
+                                self.identifier(),
+                                &book.symbol
+                            );
                         }
 
                         continue;
@@ -82,14 +89,15 @@ pub trait DepthProvider: DerefMut<Target = SocketState> + Send + Sync + 'static 
 
                     if log::log_enabled!(log::Level::Debug) {
                         warn!(
-                            "Error decoding message: {}",
+                            "Error decoding message from {:?}: {}",
+                            self.identifier(),
                             String::from_utf8_lossy(&bytes)
                         );
                     }
                 }
                 // If we receive a subscription request from the service, then
                 // issue a new subscription if needed.
-                Some(ProcessOutput::Action(ProviderAction::Subscribe { symbol, replace })) => {
+                Some(ProcessOutput::Action(ProcessorAction::Subscribe { symbol, replace })) => {
                     let symbol = symbol.to_lowercase();
                     if self.subscriptions.contains(&symbol) && !replace {
                         continue;
@@ -98,9 +106,20 @@ pub trait DepthProvider: DerefMut<Target = SocketState> + Send + Sync + 'static 
                     self.subscriptions.insert(symbol.clone());
                     let msg = self.create_subscription_message(&symbol);
 
-                    if let Err(e) = writer.send(msg).await {
-                        error!("Error subscribing to symbol {}: {:?}", symbol, e);
+                    if let Err(err) = writer.send(msg).await {
+                        error!(
+                            "Error subscribing to symbol {} in {:?} exchange: {:?}",
+                            symbol,
+                            self.identifier(),
+                            err
+                        );
                         self.subscriptions.remove(&symbol);
+                    } else {
+                        info!(
+                            "Subscribed to symbol {} in {:?} exchange.",
+                            symbol,
+                            self.identifier()
+                        );
                     }
                 }
                 // If we get disconnected accidentally or intentionally, reconnect again.
@@ -121,11 +140,10 @@ pub trait DepthProvider: DerefMut<Target = SocketState> + Send + Sync + 'static 
                     self.reset();
                     // Notify self to resubscribe existing subscriptions.
                     for symbol in self.subscriptions.drain() {
-                        let _ = action_sender
-                            .unbounded_send(ProviderAction::Subscribe {
-                                symbol,
-                                replace: true,
-                            });
+                        let _ = action_sender.unbounded_send(ProcessorAction::Subscribe {
+                            symbol,
+                            replace: true,
+                        });
                     }
                 }
                 _ => (),
@@ -151,8 +169,8 @@ pub trait DepthProvider: DerefMut<Target = SocketState> + Send + Sync + 'static 
     }
 }
 
-/// Message sent to this provider.
-pub enum ProviderAction {
+/// Message sent to this processor.
+pub enum ProcessorAction {
     Subscribe { symbol: String, replace: bool },
     // TODO: Support unsubscribing.
 }
@@ -169,6 +187,7 @@ pub struct SocketState {
 /// of which is unspecified, since different streams return different numbers of bids and asks.
 // NOTE: As soon as we parse the string as floats, we'll encounter floating point errors.
 // Maybe we should use them only for comparison and maintain them as strings? Does it matter?
+#[derive(Clone)]
 pub struct OrderBook {
     exchange: &'static str,
     symbol: String,
@@ -176,9 +195,73 @@ pub struct OrderBook {
     asks: Vec<(f64, f64)>,
 }
 
+impl OrderBook {
+    /// Consumes and returns the order book with bids and asks sorted appropriately.
+    /// (i.e., highest bids first and lowest asks first). This assumes that NaN has
+    /// been discarded by the provider's depth processor.
+    fn sorted(mut self) -> Self {
+        self.bids
+            .sort_by(|(p1, a1), (p2, a2)| match p2.partial_cmp(p1).unwrap() {
+                Ordering::Equal => a2.partial_cmp(a1).unwrap(),
+                ord => ord,
+            });
+
+        self.asks
+            .sort_by(|(p1, a1), (p2, a2)| match p1.partial_cmp(p2).unwrap() {
+                Ordering::Equal => a2.partial_cmp(a1).unwrap(),
+                ord => ord,
+            });
+
+        OrderBook {
+            exchange: self.exchange,
+            symbol: self.symbol,
+            bids: self.bids,
+            asks: self.asks,
+        }
+    }
+}
+
 /// Internal enum for selecting over streams.
 enum ProcessOutput {
     Socket(Result<Message, tungstenite::Error>),
-    Action(ProviderAction),
+    Action(ProcessorAction),
     Reconnect,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::OrderBook;
+
+    #[test]
+    fn test_order_book_sorting() {
+        #[rustfmt::skip]
+        let cases = vec![
+            vec![(0.026172, 1.13), (0.026155, 64.0), (0.026169, 23.28)],
+            vec![(0.026149, 25.0), (0.026162, 1.39), (0.026168, 0.01), (0.026162, 69.3)],
+        ];
+
+        #[rustfmt::skip]
+        let expectations = vec![
+            // Bids are sorted descending, whereas asks are sorted ascending.
+            (vec![(0.026172, 1.13), (0.026169, 23.28), (0.026155, 64.0)],
+             vec![(0.026155, 64.0), (0.026169, 23.28), (0.026172, 1.13)]),
+            // If same price value is encountered, then the amount is compared
+            // and highest amount is placed first (for asks and bids).
+            (vec![(0.026168, 0.01), (0.026162, 69.3), (0.026162, 1.39), (0.026149, 25.0)],
+             vec![(0.026149, 25.0), (0.026162, 69.3), (0.026162, 1.39), (0.026168, 0.01)]),
+        ];
+
+        for (case, (bids, asks)) in cases.into_iter().zip(expectations.into_iter()) {
+            let book = OrderBook {
+                exchange: "",
+                symbol: String::new(),
+                bids: case.clone(),
+                asks: case.clone(),
+            }
+            .sorted();
+
+            assert_eq!(book.bids, bids);
+            assert_eq!(book.asks, asks);
+        }
+    }
 }

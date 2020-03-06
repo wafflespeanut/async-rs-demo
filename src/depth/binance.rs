@@ -1,10 +1,10 @@
-use super::{DepthProvider, OrderBook, SocketState};
-use crate::error::AggregatorError;
+use super::{DepthProcessor, OrderBook, SocketState};
 use tungstenite::Message;
 
+use std::f64;
 use std::ops::{Deref, DerefMut};
 
-const DEPTH_SUFFIX: &str = "@depth20";
+const DEPTH_SUFFIX: &str = "@depth20@100ms";
 
 #[derive(Default)]
 pub struct BinanceSocket {
@@ -14,8 +14,7 @@ pub struct BinanceSocket {
 }
 
 #[async_trait::async_trait]
-impl DepthProvider for BinanceSocket {
-
+impl DepthProcessor for BinanceSocket {
     fn identifier(&self) -> &'static str {
         "binance"
     }
@@ -59,13 +58,19 @@ impl DepthProvider for BinanceSocket {
                         .data
                         .bids
                         .into_iter()
-                        .filter_map(|(p, q)| p.parse().and_then(|p| q.parse().map(|q| (p, q))).ok())
+                        .filter_map(|(p, q)| match (p.parse(), q.parse()) {
+                            (Ok(p), Ok(q)) if p != f64::NAN && q != f64::NAN => Some((p, q)),
+                            _ => None,
+                        })
                         .collect(),
                     asks: resp
                         .data
                         .asks
                         .into_iter()
-                        .filter_map(|(p, q)| p.parse().and_then(|p| q.parse().map(|q| (p, q))).ok())
+                        .filter_map(|(p, q)| match (p.parse(), q.parse()) {
+                            (Ok(p), Ok(q)) if p != f64::NAN && q != f64::NAN => Some((p, q)),
+                            _ => None,
+                        })
                         .collect(),
                 });
             }

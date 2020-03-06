@@ -28,6 +28,7 @@ tokio = { version = "0.2", features = ["io-util", "macros", "sync", "stream", "t
 tokio-tungstenite = "0.10"
 tonic = "0.1"
 tungstenite = "0.10"
+uuid = { version = "0.8", features = ["v4"] }
 
 [build-dependencies]
 tonic-build = "0.1"
