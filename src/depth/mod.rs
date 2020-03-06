@@ -8,7 +8,7 @@ use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender};
 use futures::sink::SinkExt;
 use futures::stream::{self, StreamExt};
 use tokio::net::TcpStream;
-use tokio_tungstenite::WebSocketStream;
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use tungstenite::Message;
 
 use std::cmp::Ordering;
@@ -18,8 +18,6 @@ use std::ops::DerefMut;
 use std::time::Duration;
 
 const CONN_FAIL_DELAY_SECS: u64 = 5;
-
-type WsStream = WebSocketStream<TcpStream>;
 
 /// Represents an order book depth processor for a provider.
 #[async_trait::async_trait]
@@ -49,7 +47,7 @@ pub trait DepthProcessor: DerefMut<Target = SocketState> + Send + Sync + 'static
         action_receiver: UnboundedReceiver<ProcessorAction>,
         book_sender: UnboundedSender<OrderBook>,
     ) {
-        let stream = self.attempt_connection().await;
+        let stream = attempt_connection(self.base_url()).await;
         let (mut writer, reader) = stream.split();
         let mut combined = stream::select(
             reader
@@ -62,6 +60,7 @@ pub trait DepthProcessor: DerefMut<Target = SocketState> + Send + Sync + 'static
             match combined.next().await {
                 // If we receive a ping from server, then send a pong.
                 Some(ProcessOutput::Socket(Ok(Message::Ping(bytes)))) => {
+                    debug!("Received ping from {:?}.", self.identifier());
                     if let Err(err) = writer.send(Message::Pong(bytes)).await {
                         error!(
                             "Error responding with pong to {:?}: {:?}",
@@ -103,6 +102,12 @@ pub trait DepthProcessor: DerefMut<Target = SocketState> + Send + Sync + 'static
                         continue;
                     }
 
+                    debug!(
+                        "Received (re-)subscription message for symbol {:?} in {:?}",
+                        symbol,
+                        self.identifier()
+                    );
+
                     self.subscriptions.insert(symbol.clone());
                     let msg = self.create_subscription_message(&symbol);
 
@@ -130,7 +135,7 @@ pub trait DepthProcessor: DerefMut<Target = SocketState> + Send + Sync + 'static
                         "Connection closed for {:?}. Reconnecting and restoring subscriptions...",
                         self.base_url()
                     );
-                    let stream = self.attempt_connection().await;
+                    let stream = attempt_connection(self.base_url()).await;
                     let (w, r) = stream.split();
                     writer = w;
                     *combined.get_mut().0 = r
@@ -150,22 +155,21 @@ pub trait DepthProcessor: DerefMut<Target = SocketState> + Send + Sync + 'static
             }
         }
     }
+}
 
-    /// Attempt connection until it succeeds.
-    async fn attempt_connection(&self) -> WsStream {
-        loop {
-            match tokio_tungstenite::connect_async(self.base_url()).await {
-                Ok((s, _resp)) => return s,
-                Err(e) => error!(
-                    "Connection failed for {:?}: {:?}. Retrying in {} seconds.",
-                    self.base_url(),
-                    e,
-                    CONN_FAIL_DELAY_SECS
-                ),
-            }
-
-            tokio::time::delay_for(Duration::from_secs(CONN_FAIL_DELAY_SECS)).await;
+/// Attempt connection until it succeeds.
+async fn attempt_connection(url: &str) -> WebSocketStream<MaybeTlsStream<TcpStream>> {
+    debug!("Connecting to {:?}", url);
+    loop {
+        match tokio_tungstenite::connect_async(url).await {
+            Ok((s, _resp)) => return s,
+            Err(e) => error!(
+                "Connection failed for {:?}: {:?}. Retrying in {} seconds.",
+                url, e, CONN_FAIL_DELAY_SECS
+            ),
         }
+
+        tokio::time::delay_for(Duration::from_secs(CONN_FAIL_DELAY_SECS)).await;
     }
 }
 

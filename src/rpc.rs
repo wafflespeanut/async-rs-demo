@@ -64,7 +64,13 @@ pub async fn serve(addr: SocketAddr) -> Result<(), AggregatorError> {
 
             action_senders.push(action_tx.clone());
             tokio::spawn(async move {
-                processor.start_processing(action_tx, action_rx, book_tx);
+                debug!(
+                    "Spawning task for processing {:?} data.",
+                    processor.identifier()
+                );
+                processor
+                    .start_processing(action_tx, action_rx, book_tx)
+                    .await;
             });
 
             book_rx

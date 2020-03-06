@@ -42,6 +42,11 @@ impl DepthProcessor for BinanceSocket {
                 .collect(),
         })
         .expect("serializing subscription request");
+
+        if log::log_enabled!(log::Level::Debug) {
+            debug!("Subscription message: {}", String::from_utf8_lossy(&bytes));
+        }
+
         self.idx += 1;
         Message::Binary(bytes)
     }

@@ -30,8 +30,8 @@ impl Merger {
         // Unbounded because client subscription will be fast.
         let (client_tx, client_rx) = mpsc::unbounded();
 
-        // Spawn task for updating order book summary.
         tokio::spawn(async move {
+            debug!("Spawning task for collecting order book summary.");
             let mut summary_map: HashMap<String, Summary> = HashMap::new();
 
             while let Some(book) = book_receiver.next().await {
@@ -45,8 +45,8 @@ impl Merger {
             }
         });
 
-        // Spawn task for fanout across clients.
         tokio::spawn(async move {
+            debug!("Spawning task for client fanout.");
             let mut clients = vec![];
             let mut rx = stream::select(
                 client_rx.map(MergerTask::IncomingClient),
