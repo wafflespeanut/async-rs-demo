@@ -2,14 +2,17 @@ language: rust
 rust: stable
 cache: cargo
 
+before_script:
+- rustup component add rustfmt
+
 matrix:
   include:
   - name: check
-  before_script:
-    - rustup component add rustfmt clippy
-  script:
-  - cargo fmt --all -- --check
-  - cargo clippy --all -- -D clippy::all
+    before_script:
+    - rustup component add clippy
+    script:
+    - cargo fmt --all -- --check
+    - cargo clippy --all -- -D clippy::all
   - name: build
     script:
     - cargo build

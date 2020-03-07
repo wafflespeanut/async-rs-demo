@@ -1,6 +1,5 @@
 use super::{OrderBook, Processor, SocketState};
 
-use std::f64;
 use std::ops::{Deref, DerefMut};
 
 // Detailed order book because bitstamp doesn't return the channel name otherwise,
@@ -52,7 +51,7 @@ impl Processor for BitstampSocket {
                 .bids
                 .into_iter()
                 .filter_map(|(p, q, _)| match (p.parse(), q.parse()) {
-                    (Ok(p), Ok(q)) if p != f64::NAN && q != f64::NAN => Some((p, q)),
+                    (Ok(p), Ok(q)) => Some((p, q)),
                     _ => None,
                 })
                 .collect(),
@@ -61,7 +60,7 @@ impl Processor for BitstampSocket {
                 .asks
                 .into_iter()
                 .filter_map(|(p, q, _)| match (p.parse(), q.parse()) {
-                    (Ok(p), Ok(q)) if p != f64::NAN && q != f64::NAN => Some((p, q)),
+                    (Ok(p), Ok(q)) => Some((p, q)),
                     _ => None,
                 })
                 .collect(),

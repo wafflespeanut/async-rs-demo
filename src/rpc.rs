@@ -30,7 +30,7 @@ impl Aggregator for Service {
             "Incoming connection from {:?} (client ID: {})",
             req.remote_addr()
                 .map(|a| a.to_string())
-                .unwrap_or("[unknown]".into()),
+                .unwrap_or_else(|| "[unknown]".into()),
             client_id,
         );
 

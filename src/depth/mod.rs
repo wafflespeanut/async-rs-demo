@@ -270,9 +270,11 @@ pub struct OrderBook {
 
 impl OrderBook {
     /// Consumes and returns the order book with bids and asks sorted appropriately.
-    /// (i.e., highest bids first and lowest asks first). This assumes that NaN has
-    /// been discarded by the provider's depth processor.
+    /// (i.e., highest bids first and lowest asks first). This discards NaN values.
     fn sorted(mut self) -> Self {
+        self.bids.retain(|&(p, a)| !p.is_nan() && !a.is_nan());
+        self.asks.retain(|&(p, a)| !p.is_nan() && !a.is_nan());
+
         self.bids
             .sort_by(|(p1, a1), (p2, a2)| match p2.partial_cmp(p1).unwrap() {
                 Ordering::Equal => a2.partial_cmp(a1).unwrap(),

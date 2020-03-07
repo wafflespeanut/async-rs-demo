@@ -1,6 +1,5 @@
 use super::{OrderBook, Processor, SocketState};
 
-use std::f64;
 use std::ops::{Deref, DerefMut};
 
 const STREAM_SUFFIX: &str = "@depth20@100ms";
@@ -67,7 +66,7 @@ impl Processor for BinanceSocket {
                 .bids
                 .into_iter()
                 .filter_map(|(p, q)| match (p.parse(), q.parse()) {
-                    (Ok(p), Ok(q)) if p != f64::NAN && q != f64::NAN => Some((p, q)),
+                    (Ok(p), Ok(q)) => Some((p, q)),
                     _ => None,
                 })
                 .collect(),
@@ -76,7 +75,7 @@ impl Processor for BinanceSocket {
                 .asks
                 .into_iter()
                 .filter_map(|(p, q)| match (p.parse(), q.parse()) {
-                    (Ok(p), Ok(q)) if p != f64::NAN && q != f64::NAN => Some((p, q)),
+                    (Ok(p), Ok(q)) => Some((p, q)),
                     _ => None,
                 })
                 .collect(),

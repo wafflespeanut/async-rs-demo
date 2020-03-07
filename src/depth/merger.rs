@@ -74,7 +74,7 @@ impl Merger {
                             .drain(..)
                             .filter_map(|(id, sender): (Uuid, UnboundedSender<Summary>)| {
                                 // Receiver is dropped, remove client.
-                                if let Err(_) = sender.unbounded_send(data.clone()) {
+                                if sender.unbounded_send(data.clone()).is_err() {
                                     info!("Removing subscription for client (ID: {})", id);
                                     return None;
                                 }
@@ -215,6 +215,9 @@ impl PartialOrd for Level {
     }
 }
 
+/// **NOTE:** We're hashing only the price and amount so that it makes our lives
+/// easier. For this reason, **never use** `Level` anywhere other than here.
+#[allow(clippy::derive_hash_xor_eq)]
 impl Hash for Level {
     fn hash<H>(&self, state: &mut H)
     where
