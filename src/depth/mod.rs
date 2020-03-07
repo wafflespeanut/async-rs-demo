@@ -1,7 +1,9 @@
 mod binance;
+mod bitstamp;
 mod merger;
 
 pub use self::binance::BinanceSocket;
+pub use self::bitstamp::BitstampSocket;
 pub use self::merger::Merger;
 
 use futures::channel::mpsc::{self, UnboundedReceiver, UnboundedSender};
@@ -20,10 +22,6 @@ use std::time::Duration;
 
 const CONN_FAIL_DELAY_SECS: u64 = 5;
 
-// TODO: Add trait for representing websocket messages so that we can
-// decouple tungstenite.
-pub type WsMessage = Message;
-
 /// Internal enum for selecting over streams.
 #[derive(Debug)]
 enum ProcessOutput {
@@ -34,10 +32,10 @@ enum ProcessOutput {
 
 /// Represents an order book depth processor for a provider.
 #[async_trait::async_trait]
-pub trait DepthProcessor: DerefMut<Target = SocketState> + Sized + Send + Sync + 'static {
+pub trait Processor: DerefMut<Target = SocketState> + Sized + Send + Sync + 'static {
     /* Required from implementors */
 
-    type DepthMessage: DeserializeOwned;
+    type Response: DeserializeOwned;
 
     // NOTE: We cannot use constants because `async_trait` works by wrapping the async
     // function with an actual method (from which we cannot call `Self::*`).
@@ -50,16 +48,16 @@ pub trait DepthProcessor: DerefMut<Target = SocketState> + Sized + Send + Sync +
 
     /// Reset the internal state of this processor. This is called when we
     /// recreate a connection.
-    fn reset(&mut self);
+    fn reset(&mut self) {}
 
     /// Creates the websocket message for subscribing to a symbol.
     /// This symbol will already exist in the underlying socket state,
     /// so implementors shouldn't modify the state by themselves.
-    fn create_subscription_message(&mut self, symbol: &str) -> Message;
+    fn create_subscription_message(&mut self, symbol: &str) -> String;
 
     /// We've received a valid message from the websocket. Process and return
     /// the order book. This will be called by `process_bytes` method.
-    fn process_message(&mut self, msg: Self::DepthMessage) -> OrderBook;
+    fn process_message(&mut self, msg: Self::Response) -> OrderBook;
 
     /* Provided methods. */
 
@@ -173,8 +171,11 @@ pub trait DepthProcessor: DerefMut<Target = SocketState> + Sized + Send + Sync +
 
                     self.subscriptions.insert(symbol.clone());
                     let msg = self.create_subscription_message(&symbol);
+                    if log::log_enabled!(log::Level::Debug) {
+                        debug!("Subscription message ({}): {}", self.identifier(), msg);
+                    }
 
-                    if let Err(err) = writer.send(msg).await {
+                    if let Err(err) = writer.send(Message::Text(msg)).await {
                         error!(
                             "Error subscribing to symbol {:?} in {:?} exchange: {:?}",
                             symbol,

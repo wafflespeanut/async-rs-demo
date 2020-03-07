@@ -3,7 +3,7 @@ use crate::codegen::{
     aggregator_server::{Aggregator, AggregatorServer},
     Summary,
 };
-use crate::depth::{BinanceSocket, DepthProcessor, Merger};
+use crate::depth::{BinanceSocket, BitstampSocket, Merger, Processor};
 use crate::error::AggregatorError;
 use futures::stream::{Stream, StreamExt};
 use tonic::{transport::Server, Request, Response, Status};
@@ -48,23 +48,26 @@ impl Aggregator for Service {
 
 /// Initializes the gRPC service for orderbook aggregation.
 pub async fn serve(addr: SocketAddr) -> Result<(), AggregatorError> {
-    let processors = vec![BinanceSocket::default()];
-
     let mut action_senders = vec![];
-    // Spawn a task for each processor.
-    let book_receivers = processors
-        .into_iter()
-        .map(|processor| {
-            let (action_tx, book_rx) = processor.start();
+    let mut book_receivers = vec![];
+
+    // TODO: Refactor to make "Processor" a trait object and get rid of this macro.
+    macro_rules! create_processor {
+        ($socket:ident) => {
+            let (action_tx, book_rx) = $socket::default().start();
             action_senders.push(action_tx.clone());
-            book_rx
-        })
-        .collect();
+            book_receivers.push(book_rx);
+        };
+    }
+
+    // Spawn a task for each processor.
+    create_processor!(BinanceSocket);
+    create_processor!(BitstampSocket);
 
     info!("Listening for requests in {}", addr);
     Server::builder()
         .add_service(AggregatorServer::new(Service {
-            merger: Merger::start(action_senders, book_receivers),
+            merger: Merger::start(action_senders, book_receivers.into_iter().collect()),
         }))
         .serve(addr)
         .await?;

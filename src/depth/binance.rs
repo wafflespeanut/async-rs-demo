@@ -1,10 +1,12 @@
-use super::{DepthProcessor, OrderBook, SocketState, WsMessage};
+use super::{OrderBook, Processor, SocketState};
 
 use std::f64;
 use std::ops::{Deref, DerefMut};
 
-const DEPTH_SUFFIX: &str = "@depth20@100ms";
+const STREAM_SUFFIX: &str = "@depth20@100ms";
 
+/// Websocket for Binance.
+/// https://github.com/binance-exchange/binance-official-api-docs/blob/master/web-socket-streams.md
 #[derive(Default)]
 pub struct BinanceSocket {
     state: SocketState,
@@ -13,8 +15,8 @@ pub struct BinanceSocket {
 }
 
 #[async_trait::async_trait]
-impl DepthProcessor for BinanceSocket {
-    type DepthMessage = Response;
+impl Processor for BinanceSocket {
+    type Response = Response;
 
     fn identifier(&self) -> &'static str {
         "binance"
@@ -30,7 +32,7 @@ impl DepthProcessor for BinanceSocket {
         self.idx = 0;
     }
 
-    fn create_subscription_message(&mut self, _symbol: &str) -> WsMessage {
+    fn create_subscription_message(&mut self, _symbol: &str) -> String {
         // Subscriptions are "PUT" in binance, so we need all the existing subscriptions.
         // https://github.com/binance-exchange/binance-official-api-docs/blob/master/web-socket-streams.md#subscribe-to-a-stream
         let string = serde_json::to_string(&Request {
@@ -41,22 +43,17 @@ impl DepthProcessor for BinanceSocket {
                 .subscriptions
                 .iter()
                 .map(String::as_str)
-                .map(|s| format!("{}{}", s, DEPTH_SUFFIX))
+                .map(|s| format!("{}{}", s, STREAM_SUFFIX))
                 .collect(),
         })
         .expect("serializing subscription request");
-
-        if log::log_enabled!(log::Level::Debug) {
-            debug!("Subscription message: {}", string);
-        }
-
         self.idx += 1;
-        WsMessage::Text(string)
+        string
     }
 
-    fn process_message(&mut self, resp: Self::DepthMessage) -> OrderBook {
-        let symbol = if resp.stream.ends_with(DEPTH_SUFFIX) {
-            String::from(&resp.stream[..(resp.stream.len() - DEPTH_SUFFIX.len())])
+    fn process_message(&mut self, resp: Self::Response) -> OrderBook {
+        let symbol = if resp.stream.ends_with(STREAM_SUFFIX) {
+            String::from(&resp.stream[..(resp.stream.len() - STREAM_SUFFIX.len())])
         } else {
             // If it's invalid, we'll filter it later anyway.
             resp.stream
