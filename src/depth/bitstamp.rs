@@ -3,6 +3,8 @@ use super::{OrderBook, Processor, SocketState};
 use std::f64;
 use std::ops::{Deref, DerefMut};
 
+// Detailed order book because bitstamp doesn't return the channel name otherwise,
+// and we need those names for multiple subscriptions in the same websocket.
 const CHANNEL_PREFIX: &str = "detail_order_book_";
 
 /// Websocket for Bitstamp.

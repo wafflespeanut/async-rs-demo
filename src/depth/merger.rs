@@ -18,12 +18,12 @@ const NUM_ITEMS: usize = 10;
 /// from processors, generating a summary and fanning out the summary across clients.
 pub struct Merger {
     senders: Vec<UnboundedSender<ProcessorAction>>,
-    client_sender: UnboundedSender<(Uuid, UnboundedSender<Summary>)>,
+    client_sender: UnboundedSender<(Uuid, String, UnboundedSender<Summary>)>,
 }
 
 enum MergerTask {
-    Update(Summary),
-    IncomingClient((Uuid, UnboundedSender<Summary>)),
+    Update((String, Summary)),
+    IncomingClient((Uuid, String, UnboundedSender<Summary>)),
 }
 
 impl Merger {
@@ -42,12 +42,13 @@ impl Merger {
             let mut summary_map: HashMap<String, Summary> = HashMap::new();
 
             while let Some(book) = book_receiver.next().await {
+                let symbol = book.symbol.clone();
                 let summary = summary_map
-                    .entry(book.symbol.clone())
+                    .entry(symbol.clone())
                     .or_insert_with(Summary::default);
                 let has_changed = summary.update_from_book(book);
                 if has_changed {
-                    let _ = fanout_tx.send(summary.clone()).await;
+                    let _ = fanout_tx.send((symbol, summary.clone())).await;
                 } else {
                     trace!("Skipping fanout message because summary is same.");
                 }
@@ -56,7 +57,10 @@ impl Merger {
 
         tokio::spawn(async move {
             debug!("Spawning task for client fanout.");
-            let mut clients = vec![];
+            // NOTE: Eventually, when we reach a point where we have to scale
+            // for a number of gRPC clients, we'll have to spawn a new task for clients
+            // based on symbols.
+            let mut clients: HashMap<String, Vec<_>> = HashMap::new();
             let mut rx = stream::select(
                 client_rx.map(MergerTask::IncomingClient),
                 fanout_rx.map(MergerTask::Update),
@@ -64,9 +68,10 @@ impl Merger {
 
             loop {
                 match rx.next().await {
-                    Some(MergerTask::Update(data)) => {
-                        clients = clients
-                            .into_iter()
+                    Some(MergerTask::Update((symbol, data))) => {
+                        let c = clients.get_mut(&symbol).expect("symbol doesn't exist?");
+                        *c = c
+                            .drain(..)
                             .filter_map(|(id, sender): (Uuid, UnboundedSender<Summary>)| {
                                 // Receiver is dropped, remove client.
                                 if let Err(_) = sender.unbounded_send(data.clone()) {
@@ -78,9 +83,12 @@ impl Merger {
                             })
                             .collect();
                     }
-                    Some(MergerTask::IncomingClient(client)) => {
-                        debug!("Client (ID: {}) is now subscribed.", client.0);
-                        clients.push(client);
+                    Some(MergerTask::IncomingClient((id, symbol, tx))) => {
+                        debug!("Client (ID: {}) is now subscribed.", id);
+                        clients
+                            .entry(symbol)
+                            .or_insert_with(Vec::new)
+                            .push((id, tx));
                     }
                     _ => (),
                 }
@@ -96,6 +104,7 @@ impl Merger {
     /// Registers an incoming client with an ID and the symbol they've subscribed to,
     /// and returns a stream with order book summary for that symbol.
     pub async fn add_client(&self, client_id: Uuid, symbol: String) -> UnboundedReceiver<Summary> {
+        let symbol = symbol.to_lowercase();
         for tx in &self.senders {
             let _ = tx.unbounded_send(ProcessorAction::Subscribe {
                 symbol: symbol.clone(),
@@ -104,7 +113,7 @@ impl Merger {
         }
 
         let (tx, rx) = mpsc::unbounded();
-        let _ = self.client_sender.unbounded_send((client_id, tx));
+        let _ = self.client_sender.unbounded_send((client_id, symbol, tx));
         rx
     }
 }

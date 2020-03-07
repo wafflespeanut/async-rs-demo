@@ -176,15 +176,18 @@ pub trait Processor: DerefMut<Target = SocketState> + Sized + Send + Sync + 'sta
                     }
 
                     if let Err(err) = writer.send(Message::Text(msg)).await {
+                        // This is usually a network error. We'll get an error soon,
+                        // and we'll reconnect. Don't remove the symbol.
                         error!(
                             "Error subscribing to symbol {:?} in {:?} exchange: {:?}",
                             symbol,
                             self.identifier(),
                             err
                         );
-                    // This is usually a network error. We'll get an error soon,
-                    // and we'll reconnect. Don't remove the symbol.
                     } else {
+                        // TODO: Detect invalid symbols? Exchanges don't seem to tell us
+                        // anything if symbols are invalid. Maybe we should timeout
+                        // if we don't receive anything for a few mins?
                         info!(
                             "Subscribed to symbol {:?} in {:?} exchange.",
                             symbol,
