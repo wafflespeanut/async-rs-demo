@@ -1,0 +1,18 @@
+language: rust
+rust: stable
+cache: cargo
+
+matrix:
+  include:
+  - name: check
+  before_script:
+    - rustup component add rustfmt clippy
+  script:
+  - cargo fmt --all -- --check
+  - cargo clippy --all -- -D clippy::all
+  - name: build
+    script:
+    - cargo build
+  - name: test
+    script:
+    - cargo test --all --all-features
