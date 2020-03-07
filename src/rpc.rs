@@ -5,7 +5,6 @@ use crate::codegen::{
 };
 use crate::depth::{BinanceSocket, DepthProcessor, Merger};
 use crate::error::AggregatorError;
-use futures::channel::mpsc;
 use futures::stream::{Stream, StreamExt};
 use tonic::{transport::Server, Request, Response, Status};
 use uuid::Uuid;
@@ -55,24 +54,9 @@ pub async fn serve(addr: SocketAddr) -> Result<(), AggregatorError> {
     // Spawn a task for each processor.
     let book_receivers = processors
         .into_iter()
-        .map(|mut processor| {
-            // Unbounded channel because the depth providers support notifying only
-            // every few milliseconds within which processors can respond to actions
-            // and merger can take care of sorting the order book.
-            let (action_tx, action_rx) = mpsc::unbounded();
-            let (book_tx, book_rx) = mpsc::unbounded();
-
+        .map(|processor| {
+            let (action_tx, book_rx) = processor.start();
             action_senders.push(action_tx.clone());
-            tokio::spawn(async move {
-                debug!(
-                    "Spawning task for processing {:?} data.",
-                    processor.identifier()
-                );
-                processor
-                    .start_processing(action_tx, action_rx, book_tx)
-                    .await;
-            });
-
             book_rx
         })
         .collect();

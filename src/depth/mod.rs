@@ -4,9 +4,10 @@ mod merger;
 pub use self::binance::BinanceSocket;
 pub use self::merger::Merger;
 
-use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender};
+use futures::channel::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use futures::sink::SinkExt;
 use futures::stream::{self, StreamExt};
+use serde::de::DeserializeOwned;
 use tokio::net::TcpStream;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use tungstenite::Message;
@@ -19,9 +20,28 @@ use std::time::Duration;
 
 const CONN_FAIL_DELAY_SECS: u64 = 5;
 
+// TODO: Add trait for representing websocket messages so that we can
+// decouple tungstenite.
+pub type WsMessage = Message;
+
+/// Internal enum for selecting over streams.
+#[derive(Debug)]
+enum ProcessOutput {
+    Socket(Result<Message, tungstenite::Error>),
+    Action(ProcessorAction),
+    Reconnect,
+}
+
 /// Represents an order book depth processor for a provider.
 #[async_trait::async_trait]
-pub trait DepthProcessor: DerefMut<Target = SocketState> + Send + Sync + 'static {
+pub trait DepthProcessor: DerefMut<Target = SocketState> + Sized + Send + Sync + 'static {
+    /* Required from implementors */
+
+    type DepthMessage: DeserializeOwned;
+
+    // NOTE: We cannot use constants because `async_trait` works by wrapping the async
+    // function with an actual method (from which we cannot call `Self::*`).
+
     /// Identifier for this provider.
     fn identifier(&self) -> &'static str;
 
@@ -37,10 +57,66 @@ pub trait DepthProcessor: DerefMut<Target = SocketState> + Send + Sync + 'static
     /// so implementors shouldn't modify the state by themselves.
     fn create_subscription_message(&mut self, symbol: &str) -> Message;
 
-    /// We've received binary message from the websocket. Process and return
-    /// the order book, if any.
-    fn process_message(&mut self, bytes: &[u8]) -> Option<OrderBook>;
+    /// We've received a valid message from the websocket. Process and return
+    /// the order book. This will be called by `process_bytes` method.
+    fn process_message(&mut self, msg: Self::DepthMessage) -> OrderBook;
 
+    /* Provided methods. */
+
+    /// Processes a websocket message and returns the order book, if any.
+    fn process_bytes(&mut self, bytes: &[u8]) -> Option<OrderBook> {
+        if let Ok(msg) = serde_json::from_slice(bytes) {
+            // NOTE: We're not returning directly so that we can log below.
+            let book = self.process_message(msg);
+            if self.subscriptions.contains(&book.symbol) {
+                return Some(book);
+            } else if log::log_enabled!(log::Level::Debug) {
+                warn!(
+                    "Received order book for unknown symbol from {:?}: {}",
+                    self.identifier(),
+                    &book.symbol
+                );
+            }
+        }
+
+        if log::log_enabled!(log::Level::Debug) {
+            warn!(
+                "Error decoding message from {:?}: {}",
+                self.identifier(),
+                String::from_utf8_lossy(&bytes)
+            );
+        }
+
+        None
+    }
+
+    /// Starts this processor in the background and returns a sender for sending messages
+    /// to this processor and a receiver for receiving order books from this processor.
+    fn start(
+        mut self,
+    ) -> (
+        UnboundedSender<ProcessorAction>,
+        UnboundedReceiver<OrderBook>,
+    ) {
+        // Unbounded channel because the providers usually support notifying only
+        // every few milliseconds within which processors can respond to actions
+        // and merger can take care of sorting the books (so we won't have any back-pressure).
+        let (action_tx, action_rx) = mpsc::unbounded();
+        let (book_tx, book_rx) = mpsc::unbounded();
+
+        let action_sender = action_tx.clone();
+        tokio::spawn(async move {
+            debug!("Spawning task for processing {:?} data.", self.identifier());
+            self.start_processing(action_tx, action_rx, book_tx).await;
+        });
+
+        (action_sender, book_rx)
+    }
+
+    /// Consumes the necessary channel halves and starts processing websocket events.
+    ///
+    /// **NOTE:** This only needs the receiver for getting messages from gRPC server,
+    /// but it also takes a sender so that it can notify itself about certain events.
     async fn start_processing(
         &mut self,
         action_sender: UnboundedSender<ProcessorAction>,
@@ -69,29 +145,16 @@ pub trait DepthProcessor: DerefMut<Target = SocketState> + Send + Sync + 'static
                         );
                     }
                 }
-                // If we receive a binary message from server, then try to get the orderbook
+                // If we receive a binary/text message from server, then try to get the orderbook
                 // from it and log it otherwise.
-                Some(ProcessOutput::Socket(Ok(Message::Binary(bytes)))) => {
-                    if let Some(book) = self.process_message(&bytes) {
-                        if self.subscriptions.contains(&book.symbol) {
-                            let _ = book_sender.unbounded_send(book.sorted());
-                        } else if log::log_enabled!(log::Level::Debug) {
-                            warn!(
-                                "Received order book for unknown symbol from {:?}: {}",
-                                self.identifier(),
-                                &book.symbol
-                            );
-                        }
-
-                        continue;
+                Some(ProcessOutput::Socket(Ok(Message::Text(string)))) => {
+                    if let Some(book) = self.process_bytes(string.as_bytes()) {
+                        let _ = book_sender.unbounded_send(book.sorted());
                     }
-
-                    if log::log_enabled!(log::Level::Debug) {
-                        warn!(
-                            "Error decoding message from {:?}: {}",
-                            self.identifier(),
-                            String::from_utf8_lossy(&bytes)
-                        );
+                }
+                Some(ProcessOutput::Socket(Ok(Message::Binary(bytes)))) => {
+                    if let Some(book) = self.process_bytes(&bytes) {
+                        let _ = book_sender.unbounded_send(book.sorted());
                     }
                 }
                 // If we receive a subscription request from the service, then
@@ -113,27 +176,28 @@ pub trait DepthProcessor: DerefMut<Target = SocketState> + Send + Sync + 'static
 
                     if let Err(err) = writer.send(msg).await {
                         error!(
-                            "Error subscribing to symbol {} in {:?} exchange: {:?}",
+                            "Error subscribing to symbol {:?} in {:?} exchange: {:?}",
                             symbol,
                             self.identifier(),
                             err
                         );
-                        self.subscriptions.remove(&symbol);
+                    // This is usually a network error. We'll get an error soon,
+                    // and we'll reconnect. Don't remove the symbol.
                     } else {
                         info!(
-                            "Subscribed to symbol {} in {:?} exchange.",
+                            "Subscribed to symbol {:?} in {:?} exchange.",
                             symbol,
                             self.identifier()
                         );
                     }
                 }
                 // If we get disconnected accidentally or intentionally, reconnect again.
-                Some(ProcessOutput::Reconnect)
-                | Some(ProcessOutput::Socket(Err(_)))
-                | Some(ProcessOutput::Socket(Ok(Message::Close(_)))) => {
+                r @ Some(ProcessOutput::Reconnect)
+                | r @ Some(ProcessOutput::Socket(Err(_)))
+                | r @ Some(ProcessOutput::Socket(Ok(Message::Close(_)))) => {
                     info!(
-                        "Connection closed for {:?}. Reconnecting and restoring subscriptions...",
-                        self.base_url()
+                        "Connection closed for {:?} ({:?}). Reconnecting and restoring subscriptions...",
+                        r, self.base_url()
                     );
                     let stream = attempt_connection(self.base_url()).await;
                     let (w, r) = stream.split();
@@ -174,6 +238,7 @@ async fn attempt_connection(url: &str) -> WebSocketStream<MaybeTlsStream<TcpStre
 }
 
 /// Message sent to this processor.
+#[derive(Debug)]
 pub enum ProcessorAction {
     Subscribe { symbol: String, replace: bool },
     // TODO: Support unsubscribing.
@@ -193,10 +258,10 @@ pub struct SocketState {
 // Maybe we should use them only for comparison and maintain them as strings? Does it matter?
 #[derive(Clone)]
 pub struct OrderBook {
-    exchange: &'static str,
-    symbol: String,
-    bids: Vec<(f64, f64)>,
-    asks: Vec<(f64, f64)>,
+    pub exchange: &'static str,
+    pub symbol: String,
+    pub bids: Vec<(f64, f64)>,
+    pub asks: Vec<(f64, f64)>,
 }
 
 impl OrderBook {
@@ -223,13 +288,6 @@ impl OrderBook {
             asks: self.asks,
         }
     }
-}
-
-/// Internal enum for selecting over streams.
-enum ProcessOutput {
-    Socket(Result<Message, tungstenite::Error>),
-    Action(ProcessorAction),
-    Reconnect,
 }
 
 #[cfg(test)]

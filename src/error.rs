@@ -10,6 +10,7 @@ macro_rules! impl_err_from {
     };
 }
 
+/// Error type used throughout the crate.
 #[derive(Debug, Fail)]
 #[allow(dead_code)]
 pub enum AggregatorError {

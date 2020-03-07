@@ -3,13 +3,19 @@ use crate::codegen::{Level, Summary};
 use futures::channel::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use futures::sink::SinkExt;
 use futures::stream::{self, SelectAll as StreamSelector, StreamExt};
+use ordered_float::NotNan;
+use seahash::SeaHasher;
 use uuid::Uuid;
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 
+/// Number of levels in order book summary.
 const NUM_ITEMS: usize = 10;
 
+/// Merger takes care of registering new client, gathering the order books
+/// from processors, generating a summary and fanning out the summary across clients.
 pub struct Merger {
     senders: Vec<UnboundedSender<ProcessorAction>>,
     client_sender: UnboundedSender<(Uuid, UnboundedSender<Summary>)>,
@@ -21,6 +27,7 @@ enum MergerTask {
 }
 
 impl Merger {
+    /// Create a new instance and spawn tasks in the background.
     pub fn start(
         senders: Vec<UnboundedSender<ProcessorAction>>,
         mut book_receiver: StreamSelector<UnboundedReceiver<OrderBook>>,
@@ -41,6 +48,8 @@ impl Merger {
                 let has_changed = summary.update_from_book(book);
                 if has_changed {
                     let _ = fanout_tx.send(summary.clone()).await;
+                } else {
+                    trace!("Skipping fanout message because summary is same.");
                 }
             }
         });
@@ -59,6 +68,7 @@ impl Merger {
                         clients = clients
                             .into_iter()
                             .filter_map(|(id, sender): (Uuid, UnboundedSender<Summary>)| {
+                                // Receiver is dropped, remove client.
                                 if let Err(_) = sender.unbounded_send(data.clone()) {
                                     info!("Removing subscription for client (ID: {})", id);
                                     return None;
@@ -83,6 +93,8 @@ impl Merger {
         }
     }
 
+    /// Registers an incoming client with an ID and the symbol they've subscribed to,
+    /// and returns a stream with order book summary for that symbol.
     pub async fn add_client(&self, client_id: Uuid, symbol: String) -> UnboundedReceiver<Summary> {
         for tx in &self.senders {
             let _ = tx.unbounded_send(ProcessorAction::Subscribe {
@@ -111,11 +123,8 @@ impl Summary {
             })
             .collect();
 
-        Self::merge_sorted(&mut self.bids, bids, |l1, l2| {
-            match l2.price.partial_cmp(&l1.price).unwrap() {
-                Ordering::Equal => l2.amount.partial_cmp(&l1.amount).unwrap(),
-                ord => ord,
-            }
+        let bids_changed = Self::merge_sorted(book.exchange, &mut self.bids, bids, |l1, l2| {
+            l2.partial_cmp(l1).unwrap()
         });
 
         let asks = book
@@ -128,41 +137,195 @@ impl Summary {
             })
             .collect();
 
-        Self::merge_sorted(&mut self.asks, asks, |l1, l2| {
-            match l1.price.partial_cmp(&l2.price).unwrap() {
-                Ordering::Equal => l2.amount.partial_cmp(&l1.amount).unwrap(),
-                ord => ord,
-            }
+        let asks_changed = Self::merge_sorted(book.exchange, &mut self.asks, asks, |l1, l2| {
+            l1.partial_cmp(l2).unwrap()
         });
 
-        // We could implement/use a sorting algorithm which can update the
-        // asks/bids and tell us if the book has been updated, but this is
-        // easier and it doesn't affect the performance as of now.
-        true
+        self.spread = self.asks.get(0).map(|l| l.price).unwrap_or(0.0)
+            - self.bids.get(0).map(|l| l.price).unwrap_or(0.0);
+
+        asks_changed | bids_changed
     }
 
-    /// Appends second vector to the first, sorts and returns a truncated vector.
-    // Note that we're sticking with vectors (and not say, linked lists), because
+    /// Assumes that the `existing` vector is from multiple exchanges and `appendable`
+    /// is from one order book (i.e., one exchange), removes the levels matching the given
+    /// exchange, merges the `appendable` vector, sorts and truncates so that it matches
+    /// the latest summary on 10 asks and bids.
+    // NOTE: We're sticking with vectors (and not say, linked lists), because
     // with modern processors, this goes easy on cache lines and sorting is quite
     // quick for 10 elements.
-    fn merge_sorted<T, F>(v1: &mut Vec<T>, mut v2: Vec<T>, compare: F)
+    fn merge_sorted<F>(
+        exchange: &str,
+        existing: &mut Vec<Level>,
+        mut appendable: Vec<Level>,
+        compare: F,
+    ) -> bool
     where
-        F: FnMut(&T, &T) -> Ordering,
+        F: FnMut(&Level, &Level) -> Ordering,
     {
-        if v2.is_empty() {
-            return;
+        if appendable.is_empty() {
+            return false;
         }
 
-        if v1.is_empty() {
-            *v1 = v2;
-            return;
+        if existing.is_empty() {
+            *existing = appendable;
+            return true;
         }
 
-        v1.append(&mut v2);
-        // TODO: We don't have to sort the whole thing. We could implement an
-        // algorithm which could do this really fast (given that the vectors
-        // are already sorted).
-        v1.sort_by(compare);
-        v1.truncate(NUM_ITEMS);
+        // TODO: A better way than hashing would be to implement an algorithm which
+        // could do this really fast (given that the vectors are already sorted),
+        // but this is easier and it doesn't affect the performance as of now.
+
+        let mut hasher = SeaHasher::new();
+        existing.hash(&mut hasher);
+        let hash_1 = hasher.finish();
+
+        // Truncate unnecessary items since they're already sorted.
+        existing.retain(|l| l.exchange != exchange);
+        appendable.truncate(NUM_ITEMS);
+        existing.append(&mut appendable);
+        existing.sort_by(compare);
+        existing.truncate(NUM_ITEMS);
+
+        hasher = SeaHasher::new();
+        existing.hash(&mut hasher);
+        let hash_2 = hasher.finish();
+
+        hash_1 != hash_2
+    }
+}
+
+/// **NOTE:** This implementation assumes that we're comparing levels for
+/// the **same exchanges** and that the amount and price is not `NaN`.
+impl PartialOrd for Level {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        match self.price.partial_cmp(&other.price).unwrap() {
+            Ordering::Equal => other.amount.partial_cmp(&self.amount),
+            ord => Some(ord),
+        }
+    }
+}
+
+impl Hash for Level {
+    fn hash<H>(&self, state: &mut H)
+    where
+        H: Hasher,
+    {
+        // We've already filtered NaN.
+        NotNan::new(self.price).unwrap().hash(state);
+        NotNan::new(self.amount).unwrap().hash(state);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::OrderBook;
+    use crate::codegen::Summary;
+
+    // TODO: This has 4 tests. Split this into separate tests.
+    #[test]
+    fn test_book_sorting() {
+        let mut summary = Summary::default();
+        // Initial order book only adds stuff.
+        let has_changed = summary.update_from_book(OrderBook {
+            exchange: "e1",
+            symbol: "s1".into(),
+            // NOTE: Bids and asks will be sorted when they reach the merger.
+            bids: vec![(2.739, 25.74), (2.56, 0.29), (2.45, 3.52)],
+            asks: vec![(2.8, 74.95), (2.83, 0.56), (2.835, 125.89)],
+        });
+
+        assert!(has_changed);
+        assert!(summary.spread > 0.06 && summary.spread < 0.061);
+        assert_eq!(summary.asks.len(), 3);
+        assert_eq!(summary.bids.len(), 3);
+
+        // Add book from another exchange.
+        let has_changed = summary.update_from_book(OrderBook {
+            exchange: "e2",
+            symbol: "s2".into(),
+            bids: vec![(2.565, 17.3), (2.39, 0.05)],
+            asks: vec![(2.91, 0.573), (2.7953, 57.41)],
+        });
+
+        assert!(has_changed);
+        // Both have been merged.
+        assert_eq!(
+            summary
+                .bids
+                .iter()
+                .map(|l| (l.price, l.amount))
+                .collect::<Vec<_>>(),
+            vec![
+                (2.739, 25.74),
+                (2.565, 17.3),
+                (2.56, 0.29),
+                (2.45, 3.52),
+                (2.39, 0.05),
+            ]
+        );
+        assert_eq!(
+            summary
+                .asks
+                .iter()
+                .map(|l| (l.price, l.amount))
+                .collect::<Vec<_>>(),
+            vec![
+                (2.7953, 57.41),
+                (2.8, 74.95),
+                (2.83, 0.56),
+                (2.835, 125.89),
+                (2.91, 0.573),
+            ]
+        );
+        assert!(summary.spread > 0.0563 && summary.spread < 0.0564);
+
+        for i in 0..2 {
+            // Add book from existing exchange.
+            let has_changed = summary.update_from_book(OrderBook {
+                exchange: "e2",
+                symbol: "s2".into(),
+                bids: vec![(2.479, 99.1), (2.759, 0.95)],
+                asks: vec![(2.91, 0.573), (2.8, 0.05)],
+            });
+
+            if i == 0 {
+                assert!(has_changed);
+            } else {
+                // It shouldn't have changed the second time.
+                assert!(!has_changed);
+            }
+
+            // Both have been merged.
+            assert_eq!(
+                summary
+                    .bids
+                    .iter()
+                    .map(|l| (l.price, l.amount))
+                    .collect::<Vec<_>>(),
+                vec![
+                    (2.759, 0.95),
+                    (2.739, 25.74),
+                    (2.56, 0.29),
+                    (2.479, 99.1),
+                    (2.45, 3.52),
+                ]
+            );
+            assert_eq!(
+                summary
+                    .asks
+                    .iter()
+                    .map(|l| (l.price, l.amount))
+                    .collect::<Vec<_>>(),
+                vec![
+                    (2.8, 74.95),
+                    (2.8, 0.05),
+                    (2.83, 0.56),
+                    (2.835, 125.89),
+                    (2.91, 0.573),
+                ]
+            );
+            assert!(summary.spread > 0.040999 && summary.spread < 0.041);
+        }
     }
 }

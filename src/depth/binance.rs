@@ -1,5 +1,4 @@
-use super::{DepthProcessor, OrderBook, SocketState};
-use tungstenite::Message;
+use super::{DepthProcessor, OrderBook, SocketState, WsMessage};
 
 use std::f64;
 use std::ops::{Deref, DerefMut};
@@ -15,11 +14,14 @@ pub struct BinanceSocket {
 
 #[async_trait::async_trait]
 impl DepthProcessor for BinanceSocket {
+    type DepthMessage = Response;
+
     fn identifier(&self) -> &'static str {
         "binance"
     }
 
     /// URL for combined streams in Binance.
+    /// https://github.com/binance-exchange/binance-official-api-docs/blob/master/web-socket-streams.md#general-wss-information
     fn base_url(&self) -> &'static str {
         "wss://stream.binance.com:9443/stream"
     }
@@ -28,11 +30,12 @@ impl DepthProcessor for BinanceSocket {
         self.idx = 0;
     }
 
-    fn create_subscription_message(&mut self, _symbol: &str) -> Message {
-        let bytes = serde_json::to_vec(&Request {
+    fn create_subscription_message(&mut self, _symbol: &str) -> WsMessage {
+        // Subscriptions are "PUT" in binance, so we need all the existing subscriptions.
+        // https://github.com/binance-exchange/binance-official-api-docs/blob/master/web-socket-streams.md#subscribe-to-a-stream
+        let string = serde_json::to_string(&Request {
             id: self.idx,
             method: Method::Subscribe,
-            // Subscriptions are "PUT" in binance, so we need all the existing subscriptions.
             params: self
                 .state
                 .subscriptions
@@ -44,44 +47,43 @@ impl DepthProcessor for BinanceSocket {
         .expect("serializing subscription request");
 
         if log::log_enabled!(log::Level::Debug) {
-            debug!("Subscription message: {}", String::from_utf8_lossy(&bytes));
+            debug!("Subscription message: {}", string);
         }
 
         self.idx += 1;
-        Message::Binary(bytes)
+        WsMessage::Text(string)
     }
 
-    fn process_message(&mut self, bytes: &[u8]) -> Option<OrderBook> {
-        if let Ok(resp) = serde_json::from_slice::<Response>(&bytes) {
-            if resp.stream.ends_with(DEPTH_SUFFIX) {
-                let symbol = &resp.stream[..DEPTH_SUFFIX.len()];
+    fn process_message(&mut self, resp: Self::DepthMessage) -> OrderBook {
+        let symbol = if resp.stream.ends_with(DEPTH_SUFFIX) {
+            String::from(&resp.stream[..(resp.stream.len() - DEPTH_SUFFIX.len())])
+        } else {
+            // If it's invalid, we'll filter it later anyway.
+            resp.stream
+        };
 
-                return Some(OrderBook {
-                    exchange: self.identifier(),
-                    symbol: symbol.into(),
-                    bids: resp
-                        .data
-                        .bids
-                        .into_iter()
-                        .filter_map(|(p, q)| match (p.parse(), q.parse()) {
-                            (Ok(p), Ok(q)) if p != f64::NAN && q != f64::NAN => Some((p, q)),
-                            _ => None,
-                        })
-                        .collect(),
-                    asks: resp
-                        .data
-                        .asks
-                        .into_iter()
-                        .filter_map(|(p, q)| match (p.parse(), q.parse()) {
-                            (Ok(p), Ok(q)) if p != f64::NAN && q != f64::NAN => Some((p, q)),
-                            _ => None,
-                        })
-                        .collect(),
-                });
-            }
+        OrderBook {
+            exchange: self.identifier(),
+            symbol,
+            bids: resp
+                .data
+                .bids
+                .into_iter()
+                .filter_map(|(p, q)| match (p.parse(), q.parse()) {
+                    (Ok(p), Ok(q)) if p != f64::NAN && q != f64::NAN => Some((p, q)),
+                    _ => None,
+                })
+                .collect(),
+            asks: resp
+                .data
+                .asks
+                .into_iter()
+                .filter_map(|(p, q)| match (p.parse(), q.parse()) {
+                    (Ok(p), Ok(q)) if p != f64::NAN && q != f64::NAN => Some((p, q)),
+                    _ => None,
+                })
+                .collect(),
         }
-
-        None
     }
 }
 
@@ -101,7 +103,7 @@ enum Method {
 }
 
 #[derive(Deserialize)]
-struct Response {
+pub struct Response {
     stream: String,
     data: ResponseOrderBook,
 }
